@@ -1,0 +1,100 @@
+name: CompatTelRunnerStatsAction
+
+on:
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: CompatTelRunnerStatsAction
+        shell: pwsh
+        env:
+          TIMEOUT_MINUTES: ${{ 60 }}
+        run: |
+          $targetName = "CompatTelRunner";
+          $timeoutMin = if ($env:TIMEOUT_MINUTES) { [int]$env:TIMEOUT_MINUTES } else { 60 };
+          $timeoutSec = ($timeoutMin * 60);
+          $globalWatch = [System.Diagnostics.Stopwatch]::StartNew();
+          $numCores = [Environment]::ProcessorCount;
+
+          Write-Host "Persistent process monitor active for ${targetName}.exe (Max runtime: ${timeoutSec}s)..." -ForegroundColor Cyan;
+
+          while ($true) {
+              # Check overall workflow timeout
+              if (($timeoutSec -gt 0) -and ($globalWatch.Elapsed.TotalSeconds -ge $timeoutSec)) {
+                  Write-Host "Configured timeout reached (${timeoutMin}m). Exiting workflow." -ForegroundColor Yellow;
+                  break;
+              };
+
+              Write-Host "`nWaiting for ${targetName}.exe to spawn..." -ForegroundColor Cyan;
+
+              # Wait loop for next process instance
+              $proc =$null;
+              while ($true) {
+                  if (($timeoutSec -gt 0) -and ($globalWatch.Elapsed.TotalSeconds -ge$timeoutSec)) {
+                      Write-Host "Configured timeout reached while waiting for process." -ForegroundColor Yellow;
+                      exit 0;
+                  };
+
+                  $matches = [System.Diagnostics.Process]::GetProcessesByName($targetName);
+                  if ($matches.Count -gt 0) {
+                      $proc =$matches[0];
+                      break;
+                  };
+
+                  Start-Sleep -Milliseconds 500;
+              };
+
+              $capturedPid =$proc.Id;
+              Write-Host "Process detected (PID: $capturedPid). Streaming metrics once per second..." -ForegroundColor Green;
+
+              $prevCpu =$proc.TotalProcessorTime.TotalSeconds;
+              $prevTime = [System.Diagnostics.Stopwatch]::GetTimestamp();
+
+              Write-Host ("`n{0,-10} {1,-8} {2,-8} {3,-8} {4,-10} {5,-14} {6,-14}" -f "Timestamp", "PID", "Threads", "Handles", "CPU (%)", "WorkingSet", "PrivateMem");
+              Write-Host ("-" * 78);
+
+              # Stream stats until process terminates
+              while (-not $proc.HasExited) {
+                  Start-Sleep -Seconds 1;
+                  try {
+                      $proc.Refresh();
+                      if ($proc.HasExited) { break; };
+
+                      $nowTime = [System.Diagnostics.Stopwatch]::GetTimestamp();
+                      $nowCpu = $proc.TotalProcessorTime.TotalSeconds;
+
+                      $elapsedSec = (($nowTime - $prevTime) / [System.Diagnostics.Stopwatch]::Frequency);
+                      $cpuDelta = ($nowCpu - $prevCpu);
+
+                      $cpuPercent = 0.0;
+                      if ($elapsedSec -gt 0) {
+                          $cpuPercent = (($cpuDelta / ($elapsedSec * $numCores)) * 100);
+                      };
+
+                      $prevTime = $nowTime;
+                      $prevCpu = $nowCpu;
+
+                      $wsMB = [Math]::Round(($proc.WorkingSet64 / 1MB), 2);
+                      $privMB = [Math]::Round(($proc.PrivateMemorySize64 / 1MB), 2);
+                      $timeStr = (Get-Date).ToString("HH:mm:ss");
+
+                      Write-Host ("{0,-10} {1,-8} {2,-8} {3,-8} {4,-10:N1} {5,-14} {6,-14}" -f $timeStr, $proc.Id, $proc.Threads.Count, $proc.HandleCount, $cpuPercent, "$wsMB MB", "$privMB MB");
+                  }
+                  catch {
+                      break;
+                  };
+              };
+
+              Write-Host "`nProcess ${targetName}.exe (PID: $capturedPid) exited at$(Get-Date -Format 'HH:mm:ss')." -ForegroundColor Yellow;
+
+              # Release underlying handle so subsequent instances are clean
+              $proc.Dispose();
+              $proc =$null;
+
+              # Debounce delay before resuming wait
+              Start-Sleep -Seconds 1;
+          };
